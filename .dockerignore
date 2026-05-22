@@ -1,11 +1,54 @@
-node_modules
+# Dependencies — rebuilt inside the image
+node_modules/
+.npm/
+.cache/
+
+# Secrets — supplied via env_file / compose, not baked in
 .env
 .env.*
-.git
+*.pem
+*.key
+secrets/
+
+# Version control
+.git/
 .gitignore
+.gitattributes
+.github/
+
+# Docker meta
 .dockerignore
-*.md
-*.csv
-*.log
-test/
+Dockerfile.*
+docker-compose*.yml
+compose*.yml
+
+# Local OS / editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation — not needed in the runtime image
+*.md
+LICENSE
+
+# Tests / lint / type-check — not needed in the runtime image
+test/
+eslint.config.js
+.eslintcache
+tsconfig.json
+
+# Local exports / scratch / logs
+reports/
+coverage/
+.nyc_output/
+*.log
+*.csv
+*.tgz
+*.json.bak
+
+# Claude Code / MCP client state
+.mcp.json
+.claude/

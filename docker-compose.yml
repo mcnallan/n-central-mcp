@@ -2,17 +2,22 @@ services:
   ncentral-mcp:
     build: .
     container_name: nc-mcp-server
+    # Loads all env vars from .env. NC_SERVER_URL / NC_JWT_TOKEN / MCP_API_KEY are required.
+    env_file:
+      - .env
+    # Bind to localhost on the host by default. To expose to the LAN, change the
+    # left side to "0.0.0.0:3100:3100" and ensure MCP_API_KEY is set.
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     environment:
-      - NC_SERVER_URL=${NC_SERVER_URL}
-      - NC_JWT_TOKEN=${NC_JWT_TOKEN}
-      - NC_WRITE_MODE=${NC_WRITE_MODE:-write}
-      - MCP_PORT=3100
-      - MCP_API_KEY=${MCP_API_KEY}
-      - MCP_CORS_ORIGIN=${MCP_CORS_ORIGIN:-}
-      - MCP_BIND_ADDRESS=0.0.0.0
+      # Inside the container the listener must bind to all interfaces so the
+      # host port mapping above can reach it. Host firewall + the bind on the
+      # left of `ports:` is what controls external exposure.
+      MCP_BIND_ADDRESS: 0.0.0.0
+      MCP_PORT: 3100
     restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp

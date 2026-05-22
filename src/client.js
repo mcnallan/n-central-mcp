@@ -1,27 +1,37 @@
-/**
- * N-central API client — authenticated HTTP with retry, rate-limit handling,
- * and automatic token refresh on 401.
- */
+// @ts-check
+/** N-central API client: authenticated HTTP with retry and auto re-auth on 401. */
 
 import { getAccessToken, reAuthenticate } from './auth.js';
+import { auditLog } from './logging.js';
+import { inc } from './metrics.js';
 
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 2000;
-const TIMEOUT_MS = 30_000;
+const MAX_RETRIES = Number(process.env.NC_MAX_RETRIES) || 3;
+const RETRY_DELAY_MS = Number(process.env.NC_RETRY_DELAY_MS) || 2000;
+const TIMEOUT_MS = Number(process.env.NC_REQUEST_TIMEOUT_MS) || 30_000;
 
-// GET/PUT/DELETE are idempotent — safe to retry on timeouts and 5xx.
-// POST/PATCH are not — retry only auth/rate-limit failures (which did not process the request).
+/** @typedef {'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD'} HttpMethod */
+
+// Idempotent methods retry on timeouts and 5xx. POST/PATCH retry only on
+// auth/rate-limit failures (where the request did not reach the handler).
 const IDEMPOTENT_METHODS = new Set(['GET', 'PUT', 'DELETE', 'HEAD']);
 
+/** @type {string | null} */
 let serverUrl = null;
 
+/**
+ * Set the base N-central server URL (trailing slashes stripped).
+ * @param {string} url
+ */
 export function setServerUrl(url) {
   serverUrl = url.replace(/\/+$/, '');
 }
 
 /**
- * Validates a value for safe use in a URL path segment.
- * Rejects empty strings, path traversal, slashes, and special chars.
+ * Validate a value for safe use in a URL path segment.
+ *
+ * @param {string | number} value
+ * @returns {string}
+ * @throws {Error}
  */
 export function sanitizePathParam(value) {
   const str = String(value);
@@ -39,6 +49,12 @@ export function sanitizePathParam(value) {
   return str;
 }
 
+/**
+ * @param {HttpMethod} method
+ * @param {string} path
+ * @param {{ params?: Record<string, unknown>, body?: unknown }} [options]
+ * @returns {Promise<unknown>}
+ */
 async function apiRequest(method, path, { params = {}, body = null } = {}) {
   if (!serverUrl) throw new Error('Server URL not set');
 
@@ -70,7 +86,8 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
       if (err.name === 'AbortError') {
         if (attempt < MAX_RETRIES && canRetryTransient) {
           const delay = RETRY_DELAY_MS * 2 ** attempt;
-          console.error(`Timeout on ${method} ${stripQuery(path)}, retry in ${delay}ms...`);
+          auditLog('api_retry', { method, path: stripQuery(path), reason: 'timeout', attempt: attempt + 1, delayMs: delay });
+        inc('nc_mcp_api_retries_total', { reason: 'timeout' });
           await sleep(delay);
           continue;
         }
@@ -84,7 +101,8 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
     if (res.status === 429) {
       if (attempt < MAX_RETRIES) {
         const delay = RETRY_DELAY_MS * 2 ** attempt;
-        console.error(`Rate limited (429), retry in ${delay}ms...`);
+        auditLog('api_retry', { method, path: stripQuery(path), status: 429, attempt: attempt + 1, delayMs: delay });
+        inc('nc_mcp_api_retries_total', { reason: '429' });
         await sleep(delay);
         continue;
       }
@@ -93,8 +111,11 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
 
     if (res.status === 401) {
       if (attempt < MAX_RETRIES) {
-        console.error('Got 401, re-authenticating...');
+        const delay = attempt > 0 ? RETRY_DELAY_MS * 2 ** (attempt - 1) : 0;
+        auditLog('api_retry', { method, path: stripQuery(path), status: 401, attempt: attempt + 1, delayMs: delay });
+        inc('nc_mcp_api_retries_total', { reason: '401' });
         await reAuthenticate();
+        if (delay) await sleep(delay);
         continue;
       }
       throw new Error('Unauthorized (401) after re-auth');
@@ -103,7 +124,8 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
     if (res.status === 500 || res.status === 503) {
       if (attempt < MAX_RETRIES && canRetryTransient) {
         const delay = RETRY_DELAY_MS * 2 ** attempt;
-        console.error(`Server error (${res.status}) on ${method} ${stripQuery(path)}, retry in ${delay}ms...`);
+        auditLog('api_retry', { method, path: stripQuery(path), status: res.status, attempt: attempt + 1, delayMs: delay });
+        inc('nc_mcp_api_retries_total', { reason: String(res.status) });
         await sleep(delay);
         continue;
       }
@@ -120,20 +142,26 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
     const text = await res.text();
     if (!text) return null;
 
+    const contentType = res.headers.get('content-type') || '';
+    const looksJson = contentType.includes('json') || /^\s*[{[]/.test(text);
+
+    if (!looksJson) return text;
+
     let data;
     try {
       data = JSON.parse(text);
     } catch {
-      return text;
+      throw new Error(`Invalid JSON from ${method} ${stripQuery(path)}: ${truncate(text, 120)}`);
     }
 
-    // N-central sometimes wraps errors inside 200 responses
+    // N-central wraps some errors as `error message` inside 200 responses.
     if (data?.['error message']) {
       throw new Error(`API error in 200 response: ${truncate(data['error message'], 200)}`);
     }
 
     return data;
   }
+  throw new Error(`apiRequest: retry loop exhausted on ${method} ${stripQuery(path)} without returning`);
 }
 
 export function apiGet(path, params = {}) {

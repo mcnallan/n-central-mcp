@@ -9,14 +9,25 @@
     "nc-mcp-server": "./index.js"
   },
   "scripts": {
-    "start": "node index.js",
-    "start:http": "MCP_PORT=3100 node index.js",
-    "test": "node --test test/*.test.js"
+    "start": "node --env-file-if-exists=.env index.js",
+    "start:stdio": "node --env-file-if-exists=.env index.js",
+    "start:http": "MCP_PORT=3100 node --env-file-if-exists=.env index.js",
+    "test": "node --test test/*.test.js",
+    "lint": "eslint .",
+    "type-check": "tsc --noEmit --allowJs --checkJs --target esnext --module nodenext --moduleResolution nodenext --strict false --resolveJsonModule index.js src/**/*.js"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.9.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25 || ^4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "eslint-plugin-n": "^17.0.0",
+    "globals": "^15.0.0",
+    "typescript": "^5.4.0"
   }
 }

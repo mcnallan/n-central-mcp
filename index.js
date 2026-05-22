@@ -1,41 +1,34 @@
 #!/usr/bin/env node
 
-/**
- * N-central MCP Server
- *
- * Exposes N-central REST API GET endpoints as MCP tools, with resources
- * for org hierarchy context and prompts for common workflows.
- *
- * Env vars:
- *   NC_SERVER_URL    - N-central server URL
- *   NC_JWT_TOKEN     - User-API JWT token from N-central
- *   NC_WRITE_MODE    - read-only | write | full (default: write)
- *   MCP_PORT         - Set to enable Streamable HTTP mode (otherwise stdio)
- *   MCP_API_KEY      - Required for HTTP mode auth
- *   MCP_CORS_ORIGIN  - Allowed CORS origin (default: disabled)
- *   MCP_BIND_ADDRESS - Bind address (default: 127.0.0.1)
- */
+/** N-central MCP server entry point. See README.md and .env.example for configuration. */
 
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { z } from 'zod';
 import http from 'http';
+
+import { safeCompare, jsonSchemaToZod, parseAuthorizationHeader } from './src/server-utils.js';
+import { inc, setGauge, renderPrometheus } from './src/metrics.js';
 
 import { authenticate } from './src/auth.js';
 import { setServerUrl } from './src/client.js';
-import { registerResources } from './src/resources.js';
-import { registerPrompts } from './src/prompts.js';
+import { registerResources, RESOURCE_COUNT } from './src/resources.js';
+import { registerPrompts, PROMPT_COUNT } from './src/prompts.js';
 import { auditLog } from './src/logging.js';
+import { isToolAllowed as _isToolAllowed, buildToolAnnotations } from './src/tool-registry.js';
 
 import { deviceTools } from './src/tools/devices.js';
 import { organizationTools } from './src/tools/organizations.js';
 import { scheduledTaskTools } from './src/tools/scheduled-tasks.js';
 import { customPropertyTools } from './src/tools/custom-properties.js';
 import { userTools } from './src/tools/users.js';
-import { miscTools } from './src/tools/misc.js';
+import { noteTools } from './src/tools/notes.js';
+import { maintenanceWindowTools } from './src/tools/maintenance-windows.js';
+import { registrationTools } from './src/tools/registration.js';
+import { psaTools } from './src/tools/psa.js';
+import { serverInfoTools } from './src/tools/server-info.js';
 import { reportTools } from './src/tools/reports.js';
 
 const NC_SERVER_URL = process.env.NC_SERVER_URL;
@@ -51,14 +44,14 @@ if (!NC_SERVER_URL || !NC_JWT_TOKEN) {
 const MCP_API_KEY = process.env.MCP_API_KEY || null;
 const MCP_CORS_ORIGIN = process.env.MCP_CORS_ORIGIN || null;
 const MCP_BIND_ADDRESS = process.env.MCP_BIND_ADDRESS || '127.0.0.1';
-const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX = 120;
+const MCP_ALLOW_UNAUTHENTICATED = process.env.MCP_ALLOW_UNAUTHENTICATED === '1';
+const MAX_BODY_SIZE = Number(process.env.MCP_MAX_BODY_SIZE) || 1024 * 1024; // 1 MB
+const RATE_LIMIT_WINDOW_MS = Number(process.env.MCP_RATE_LIMIT_WINDOW_MS) || 60_000;
+const RATE_LIMIT_MAX = Number(process.env.MCP_RATE_LIMIT_MAX) || 120;
+const MAX_SESSIONS = Number(process.env.MCP_MAX_SESSIONS) || 256;
+const MAX_RATE_LIMIT_ENTRIES = 10_000;
+const QUIET = process.env.MCP_QUIET === '1';
 
-// Write mode gates which tools get registered.
-//   read-only   — only GET/read tools (writeScope: 'read')
-//   write       — adds create/update tools (writeScope: 'write')
-//   full        — adds destructive tools: delete/direct-execution (writeScope: 'destructive')
 const NC_WRITE_MODE = (process.env.NC_WRITE_MODE || 'write').toLowerCase();
 const VALID_WRITE_MODES = new Set(['read-only', 'write', 'full']);
 if (!VALID_WRITE_MODES.has(NC_WRITE_MODE)) {
@@ -80,15 +73,8 @@ const SENSITIVE_TOOLS = new Set([
   'get_access_group',
 ]);
 
-function isToolAllowed(tool) {
-  const scope = tool.writeScope || 'read';
-  if (scope === 'read') return true;
-  if (scope === 'write') return NC_WRITE_MODE === 'write' || NC_WRITE_MODE === 'full';
-  if (scope === 'destructive') return NC_WRITE_MODE === 'full';
-  return false;
-}
+const isToolAllowed = (tool) => _isToolAllowed(tool, NC_WRITE_MODE);
 
-// --- Rate limiting ---
 
 const rateLimitMap = new Map();
 
@@ -97,6 +83,17 @@ function checkRateLimit(ip) {
   let entry = rateLimitMap.get(ip);
 
   if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    if (!entry && rateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
+      let oldestIp = null;
+      let oldestStart = Infinity;
+      for (const [k, v] of rateLimitMap) {
+        if (v.windowStart < oldestStart) {
+          oldestStart = v.windowStart;
+          oldestIp = k;
+        }
+      }
+      if (oldestIp) rateLimitMap.delete(oldestIp);
+    }
     entry = { count: 1, windowStart: now };
     rateLimitMap.set(ip, entry);
     return true;
@@ -116,7 +113,6 @@ const rateLimitCleanup = setInterval(() => {
 }, RATE_LIMIT_WINDOW_MS);
 rateLimitCleanup.unref();
 
-// --- Tool registration ---
 
 const allTools = [
   ...deviceTools,
@@ -124,47 +120,18 @@ const allTools = [
   ...scheduledTaskTools,
   ...customPropertyTools,
   ...userTools,
-  ...miscTools,
+  ...noteTools,
+  ...maintenanceWindowTools,
+  ...registrationTools,
+  ...psaTools,
+  ...serverInfoTools,
   ...reportTools,
 ].filter(isToolAllowed);
 
-// Any non-read tool is sensitive — audit-log every call.
 for (const tool of allTools) {
   if (tool.writeScope && tool.writeScope !== 'read') SENSITIVE_TOOLS.add(tool.name);
 }
 
-function jsonSchemaToZod(prop) {
-  let schema;
-  switch (prop.type) {
-    case 'number':
-    case 'integer':
-      schema = z.number();
-      break;
-    case 'boolean':
-      schema = z.boolean();
-      break;
-    case 'array': {
-      const itemType = prop.items?.type;
-      if (itemType === 'number' || itemType === 'integer') schema = z.array(z.number());
-      else if (itemType === 'boolean') schema = z.array(z.boolean());
-      else if (itemType === 'object') schema = z.array(z.object({}).passthrough());
-      else schema = z.array(z.string());
-      break;
-    }
-    case 'object':
-      schema = z.object({}).passthrough();
-      break;
-    case 'string':
-      schema = (prop.enum?.length) ? z.enum(prop.enum) : z.string();
-      break;
-    default:
-      schema = z.string();
-  }
-  if (prop.description) schema = schema.describe(prop.description);
-  return schema;
-}
-
-// Lazy auth — only authenticates on first tool call
 let authenticated = false;
 let pendingAuthInit = null;
 
@@ -172,8 +139,6 @@ async function ensureAuthenticated() {
   if (authenticated) return;
   if (pendingAuthInit) return pendingAuthInit;
 
-  // Hold a local ref so callers that raced past the guard above can still
-  // await the same promise after the finally block clears pendingAuthInit.
   const p = (async () => {
     setServerUrl(NC_SERVER_URL);
     await authenticate(NC_SERVER_URL, NC_JWT_TOKEN);
@@ -209,8 +174,10 @@ function createServer() {
 
     const handler = tool.handler;
     const toolName = tool.name;
+    const annotations = buildToolAnnotations(tool);
 
-    srv.tool(toolName, tool.description, schemaShape, async (args) => {
+    srv.tool(toolName, tool.description, schemaShape, annotations, async (args) => {
+      const t0 = Date.now();
       try {
         await ensureAuthenticated();
 
@@ -219,12 +186,16 @@ function createServer() {
         }
 
         const result = await handler(args);
-        auditLog('tool_call', { tool: toolName, success: true });
+        const durationMs = Date.now() - t0;
+        auditLog('tool_call', { tool: toolName, success: true, durationMs });
+        inc('nc_mcp_tool_calls_total', { tool: toolName, success: 'true' });
 
-        const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+        const text = typeof result === 'string' ? result : JSON.stringify(result);
         return { content: [{ type: 'text', text }] };
       } catch (error) {
-        auditLog('tool_error', { tool: toolName, error: error.message });
+        const durationMs = Date.now() - t0;
+        auditLog('tool_error', { tool: toolName, error: error.message, durationMs });
+        inc('nc_mcp_tool_calls_total', { tool: toolName, success: 'false' });
         return {
           content: [{ type: 'text', text: `Error: ${sanitizeErrorMessage(error.message)}` }],
           isError: true,
@@ -275,40 +246,21 @@ function parseBody(req) {
 
 function authenticateRequest(req) {
   if (!MCP_API_KEY) return true;
-
-  const header = req.headers['authorization'];
-  if (!header) return false;
-
-  const parts = header.split(' ');
-  const token = (parts.length === 2 && parts[0].toLowerCase() === 'bearer')
-    ? parts[1]
-    : header;
-
+  const token = parseAuthorizationHeader(req.headers['authorization']);
+  if (!token) return false;
   return safeCompare(token, MCP_API_KEY);
 }
 
-function safeCompare(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) {
-    // Burn constant time even on length mismatch
-    timingSafeEqual(bufA, bufA);
-    return false;
-  }
-  return timingSafeEqual(bufA, bufB);
-}
+const TRUST_PROXY = process.env.MCP_TRUST_PROXY === '1';
 
 function getClientIp(req) {
-  // Only trust X-Forwarded-For behind a known reverse proxy.
-  // In direct-exposure mode this header is untrusted (client-spoofable),
-  // but rate limiting is per-socket IP anyway — the header is best-effort.
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) return forwarded.split(',')[0].trim();
+  if (TRUST_PROXY) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) return forwarded.split(',')[0].trim();
+  }
   return req.socket?.remoteAddress || 'unknown';
 }
 
-// --- Global error handlers ---
 
 const MCP_PORT = process.env.MCP_PORT;
 
@@ -324,43 +276,78 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-// --- Main ---
 
 async function main() {
   try {
-    const resourceCount = 4;
-    const promptCount = 4;
-    console.error(`Registered ${allTools.length} tools, ${resourceCount} resources, ${promptCount} prompts (NC_WRITE_MODE=${NC_WRITE_MODE})`);
-    console.error('Auth will be performed on first tool call.');
+    if (MCP_PORT && !MCP_API_KEY && !MCP_ALLOW_UNAUTHENTICATED) {
+      console.error('FATAL: MCP_PORT is set but MCP_API_KEY is not. HTTP mode requires an API key.');
+      console.error('       Set MCP_API_KEY (e.g. `openssl rand -hex 32`) or set MCP_ALLOW_UNAUTHENTICATED=1 for local dev.');
+      process.exit(1);
+    }
+
+    if (!QUIET) {
+      console.error(`Registered ${allTools.length} tools, ${RESOURCE_COUNT} resources, ${PROMPT_COUNT} prompts (NC_WRITE_MODE=${NC_WRITE_MODE})`);
+      console.error('Auth will be performed on first tool call.');
+    }
 
     if (MCP_PORT) {
-      if (!MCP_API_KEY) {
-        console.error('⚠️  WARNING: MCP_API_KEY not set — HTTP endpoint is unauthenticated!');
+      if (!MCP_API_KEY && MCP_ALLOW_UNAUTHENTICATED) {
+        console.error('⚠️  WARNING: MCP_API_KEY not set — HTTP endpoint is unauthenticated (MCP_ALLOW_UNAUTHENTICATED=1).');
       }
-      if (!MCP_CORS_ORIGIN) {
+      if (!MCP_CORS_ORIGIN && !QUIET) {
         console.error('ℹ️  CORS disabled (no MCP_CORS_ORIGIN set).');
       }
 
-      const transports = {};
-      const sessionLastActivity = {};
-      const SESSION_TTL_MS = 30 * 60_000;
-      const cleaningUp = new Set();
+      const transports = new Map();
+      const sessionLastActivity = new Map();
+      const SESSION_TTL_MS = Number(process.env.MCP_SESSION_TTL_MS) || 30 * 60_000;
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+      function validSessionId(id) {
+        return typeof id === 'string' && UUID_RE.test(id);
+      }
 
       const httpServer = http.createServer(async (req, res) => {
         const url = new URL(req.url, `http://localhost:${MCP_PORT}`);
         const clientIp = getClientIp(req);
 
-        // CORS
         if (MCP_CORS_ORIGIN) {
-          res.setHeader('Access-Control-Allow-Origin', MCP_CORS_ORIGIN);
-          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
-          res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+          const allowed = MCP_CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
+          const reqOrigin = req.headers.origin;
+          if (reqOrigin && allowed.includes(reqOrigin)) {
+            res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+            res.setHeader('Vary', 'Origin');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
+            res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+          }
         }
 
         if (req.method === 'OPTIONS') {
-          res.writeHead(MCP_CORS_ORIGIN ? 204 : 403);
+          if (MCP_CORS_ORIGIN && res.hasHeader('Access-Control-Allow-Origin')) {
+            res.writeHead(204);
+          } else {
+            res.writeHead(405, { Allow: 'POST, GET, DELETE' });
+          }
           res.end();
+          return;
+        }
+
+        if (url.pathname === '/healthz' || url.pathname === '/health') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', sessions: transports.size }));
+          return;
+        }
+
+        if (url.pathname === '/metrics') {
+          if (process.env.MCP_METRICS_REQUIRE_AUTH === '1' && !authenticateRequest(req)) {
+            res.writeHead(401, { 'Content-Type': 'text/plain' });
+            res.end('Unauthorized');
+            return;
+          }
+          setGauge('nc_mcp_active_sessions', transports.size);
+          res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+          res.end(renderPrometheus());
           return;
         }
 
@@ -389,28 +376,29 @@ async function main() {
             const body = await parseBody(req);
             const sessionId = req.headers['mcp-session-id'];
 
-            if (sessionId && transports[sessionId]) {
-              if (cleaningUp.has(sessionId)) {
-                res.writeHead(410, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Session expired' }, id: null }));
+            if (sessionId && validSessionId(sessionId) && transports.has(sessionId)) {
+              sessionLastActivity.set(sessionId, Date.now());
+              await transports.get(sessionId).handleRequest(req, res, body);
+            } else if (!sessionId && isInitializeRequest(body)) {
+              if (transports.size >= MAX_SESSIONS) {
+                auditLog('session_limit_reached', { ip: clientIp, count: transports.size });
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Server session limit reached' }, id: null }));
                 return;
               }
-              sessionLastActivity[sessionId] = Date.now();
-              await transports[sessionId].handleRequest(req, res, body);
-            } else if (!sessionId && isInitializeRequest(body)) {
               auditLog('session_init', { ip: clientIp });
               const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => randomUUID(),
                 onsessioninitialized: (sid) => {
-                  transports[sid] = transport;
-                  sessionLastActivity[sid] = Date.now();
+                  transports.set(sid, transport);
+                  sessionLastActivity.set(sid, Date.now());
                 },
               });
               transport.onclose = () => {
                 const sid = transport.sessionId;
                 if (sid) {
-                  delete transports[sid];
-                  delete sessionLastActivity[sid];
+                  transports.delete(sid);
+                  sessionLastActivity.delete(sid);
                 }
               };
               const server = createServer();
@@ -432,25 +420,25 @@ async function main() {
 
         if (req.method === 'GET') {
           const sessionId = req.headers['mcp-session-id'];
-          if (!sessionId || !transports[sessionId]) {
+          if (!sessionId || !validSessionId(sessionId) || !transports.has(sessionId)) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Invalid session');
             return;
           }
-          sessionLastActivity[sessionId] = Date.now();
-          await transports[sessionId].handleRequest(req, res);
+          sessionLastActivity.set(sessionId, Date.now());
+          await transports.get(sessionId).handleRequest(req, res);
           return;
         }
 
         if (req.method === 'DELETE') {
           const sessionId = req.headers['mcp-session-id'];
-          if (!sessionId || !transports[sessionId]) {
+          if (!sessionId || !validSessionId(sessionId) || !transports.has(sessionId)) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Invalid session');
             return;
           }
           auditLog('session_delete', { sessionId, ip: clientIp });
-          await transports[sessionId].handleRequest(req, res);
+          await transports.get(sessionId).handleRequest(req, res);
           return;
         }
 
@@ -470,30 +458,28 @@ async function main() {
       async function shutdown() {
         console.error('Shutting down...');
         auditLog('server_shutdown', {});
-        for (const sid of Object.keys(transports)) {
-          try { await transports[sid].close(); } catch {}
-          delete transports[sid];
+        for (const [sid, transport] of transports) {
+          try { await transport.close(); } catch { /* ignore */ }
+          transports.delete(sid);
         }
         process.exit(0);
       }
       process.on('SIGINT', shutdown);
       process.on('SIGTERM', shutdown);
 
-      // Clean up stale sessions
       const sessionCleanup = setInterval(() => {
         const now = Date.now();
-        for (const sid of Object.keys(transports)) {
-          if (!sessionLastActivity[sid]) {
-            sessionLastActivity[sid] = now;
-          } else if (now - sessionLastActivity[sid] > SESSION_TTL_MS) {
-            if (cleaningUp.has(sid)) continue;
-            cleaningUp.add(sid);
+        for (const sid of transports.keys()) {
+          if (!sessionLastActivity.has(sid)) {
+            sessionLastActivity.set(sid, now);
+          } else if (now - sessionLastActivity.get(sid) > SESSION_TTL_MS) {
             auditLog('session_expired', { sessionId: sid });
             console.error(`Cleaning stale session: ${sid}`);
-            try { transports[sid].close(); } catch {}
-            delete transports[sid];
-            delete sessionLastActivity[sid];
-            cleaningUp.delete(sid);
+            const transport = transports.get(sid);
+            // Delete before awaiting close so concurrent requests see 400 instead of a closing transport.
+            transports.delete(sid);
+            sessionLastActivity.delete(sid);
+            try { transport?.close(); } catch { /* ignore */ }
           }
         }
       }, 5 * 60_000);

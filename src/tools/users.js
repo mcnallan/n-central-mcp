@@ -1,25 +1,45 @@
 /** User and access group tools. */
 
 import { apiGet, apiPost, sanitizePathParam } from '../client.js';
-import { paginationParams, paginationArgs } from '../shared.js';
-import { fetchAll } from '../paginator.js';
+import { paginationParams, formatParam, fetchOrPaginate, formatResult } from '../shared.js';
 
 export const userTools = [
   {
+    name: 'list_all_users',
+    description: 'Retrieve a global list of all users in N-central (not scoped by org unit). Returns one page by default — set `all: true` to auto-paginate. Use `format: "csv"` for spreadsheet-ready output.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...paginationParams, ...formatParam },
+    },
+    handler: async (args) => {
+      const result = await fetchOrPaginate('/api/users', {}, args);
+      return formatResult(result, args.format);
+    },
+  },
+  {
+    name: 'get_current_user',
+    description: 'Retrieve details for the currently authenticated user. Useful for "who am I" introspection.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      return await apiGet('/api/users/me');
+    },
+  },
+  {
     name: 'list_users',
-    description: 'Retrieve the list of users for a specific organization unit. Returns one page by default — set `all: true` to auto-paginate.',
+    description: 'Retrieve the list of users for a specific organization unit. Returns one page by default — set `all: true` to auto-paginate. Use `format: "csv"` for spreadsheet-ready output.',
     inputSchema: {
       type: 'object',
       properties: {
         orgUnitId: { type: 'number', description: 'The organization unit ID' },
         ...paginationParams,
+        ...formatParam,
       },
       required: ['orgUnitId'],
     },
     handler: async (args) => {
       const path = `/api/org-units/${sanitizePathParam(args.orgUnitId)}/users`;
-      if (args.all) return await fetchAll(path);
-      return await apiGet(path, paginationArgs(args));
+      const result = await fetchOrPaginate(path, {}, args);
+      return formatResult(result, args.format);
     },
   },
   {
@@ -35,8 +55,7 @@ export const userTools = [
     },
     handler: async (args) => {
       const path = `/api/org-units/${sanitizePathParam(args.orgUnitId)}/user-roles`;
-      if (args.all) return await fetchAll(path);
-      return await apiGet(path, paginationArgs(args));
+      return await fetchOrPaginate(path, {}, args);
     },
   },
   {
@@ -45,8 +64,8 @@ export const userTools = [
     inputSchema: {
       type: 'object',
       properties: {
-        orgUnitId: { type: 'string', description: 'The organization unit ID' },
-        userRoleId: { type: 'string', description: 'The user role ID' },
+        orgUnitId: { type: 'number', description: 'The organization unit ID' },
+        userRoleId: { type: 'number', description: 'The user role ID' },
       },
       required: ['orgUnitId', 'userRoleId'],
     },
@@ -67,8 +86,7 @@ export const userTools = [
     },
     handler: async (args) => {
       const path = `/api/org-units/${sanitizePathParam(args.orgUnitId)}/access-groups`;
-      if (args.all) return await fetchAll(path);
-      return await apiGet(path, paginationArgs(args));
+      return await fetchOrPaginate(path, {}, args);
     },
   },
   {

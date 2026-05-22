@@ -1,4 +1,18 @@
+// @ts-check
 /** Shared tool schema helpers. */
+
+import { apiGet } from './client.js';
+import { fetchAll, toCsv } from './paginator.js';
+
+/** @typedef {{ pageNumber?: number, pageSize?: number, select?: string, sortBy?: string, sortOrder?: string, all?: boolean, format?: 'csv' | 'json' }} PaginationArgs */
+
+export const formatParam = {
+  format: {
+    type: 'string',
+    description: 'Output format: "csv" or "json". Default varies by tool — list_* default to json; report_* default to csv.',
+    enum: ['csv', 'json'],
+  },
+};
 
 export const paginationParams = {
   pageNumber: { type: 'number', description: 'Page number (starts at 1)' },
@@ -20,11 +34,43 @@ export const paginationParams = {
 };
 
 export function paginationArgs(args) {
+  // Clamp pageSize to N-central's documented range; pageNumber to >=1.
+  const clampedPageSize = args.pageSize != null
+    ? Math.min(200, Math.max(1, Number(args.pageSize) || 1))
+    : undefined;
+  const clampedPageNumber = args.pageNumber != null
+    ? Math.max(1, Number(args.pageNumber) || 1)
+    : undefined;
   return {
-    pageNumber: args.pageNumber,
-    pageSize: args.pageSize,
+    pageNumber: clampedPageNumber,
+    pageSize: clampedPageSize,
     select: args.select,
     sortBy: args.sortBy,
     sortOrder: args.sortOrder,
   };
+}
+
+/**
+ * Fetch a single page or auto-paginate based on `args.all`.
+ *
+ * @param {string} path
+ * @param {Record<string, unknown>} baseParams
+ * @param {PaginationArgs} [args]
+ * @returns {Promise<unknown>}
+ */
+export async function fetchOrPaginate(path, baseParams, args) {
+  if (args?.all) return fetchAll(path, baseParams);
+  return apiGet(path, { ...baseParams, ...paginationArgs(args || {}) });
+}
+
+/**
+ * Format a result as JSON or CSV. Unwraps `.data` envelopes before CSV conversion.
+ */
+export function formatResult(result, format) {
+  if (format !== 'csv') return result;
+  const items = result?.data && Array.isArray(result.data) ? result.data
+    : Array.isArray(result) ? result
+    : result == null ? []
+    : [result];
+  return toCsv(items);
 }

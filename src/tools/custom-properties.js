@@ -1,10 +1,10 @@
-/** Custom property tools — device and org unit properties. */
+/** Custom property tools (device + org-unit). */
 
 import { apiGet, apiPut, sanitizePathParam } from '../client.js';
-import { paginationParams, paginationArgs } from '../shared.js';
-import { fetchAll } from '../paginator.js';
+import { paginationParams, formatParam, fetchOrPaginate, formatResult } from '../shared.js';
 
 const PROPERTY_TYPES = ['HTML_LINK', 'TEXT', 'DATE', 'ENUMERATED', 'PASSWORD'];
+
 const PROPAGATION_TYPES = [
   'NO_PROPAGATION', 'SERVICE_ORGANIZATION_ONLY',
   'SERVICE_ORGANIZATION_AND_CUSTOMER_AND_SITE', 'SERVICE_ORGANIZATION_AND_CUSTOMER',
@@ -13,19 +13,28 @@ const PROPAGATION_TYPES = [
   'SERVICE_AND_DEVICE', 'ORGANIZATION_AND_DEVICE', 'ORGANIZATION_ONLY', 'DEVICE_ONLY',
 ];
 
+async function updateCustomProperty(basePath, idValue, propertyId, body) {
+  return await apiPut(
+    `${basePath}/${sanitizePathParam(idValue)}/custom-properties/${sanitizePathParam(propertyId)}`,
+    { propertyId: String(propertyId), ...body }
+  );
+}
+
 export const customPropertyTools = [
   {
     name: 'list_device_custom_properties',
-    description: 'Retrieve all custom properties for a specific device.',
+    description: 'Retrieve all custom properties for a specific device. Use `format: "csv"` for spreadsheet-ready output.',
     inputSchema: {
       type: 'object',
       properties: {
         deviceId: { type: 'string', description: 'The device ID' },
+        ...formatParam,
       },
       required: ['deviceId'],
     },
     handler: async (args) => {
-      return await apiGet(`/api/devices/${sanitizePathParam(args.deviceId)}/custom-properties`);
+      const result = await apiGet(`/api/devices/${sanitizePathParam(args.deviceId)}/custom-properties`);
+      return formatResult(result, args.format);
     },
   },
   {
@@ -45,19 +54,20 @@ export const customPropertyTools = [
   },
   {
     name: 'list_org_custom_properties',
-    description: 'Retrieve the list of custom properties for an organization unit. Returns one page by default — set `all: true` to auto-paginate.',
+    description: 'Retrieve the list of custom properties for an organization unit. Returns one page by default — set `all: true` to auto-paginate. Use `format: "csv"` for spreadsheet-ready output.',
     inputSchema: {
       type: 'object',
       properties: {
         orgUnitId: { type: 'number', description: 'The organization unit ID' },
         ...paginationParams,
+        ...formatParam,
       },
       required: ['orgUnitId'],
     },
     handler: async (args) => {
       const path = `/api/org-units/${sanitizePathParam(args.orgUnitId)}/custom-properties`;
-      if (args.all) return await fetchAll(path);
-      return await apiGet(path, paginationArgs(args));
+      const result = await fetchOrPaginate(path, {}, args);
+      return formatResult(result, args.format);
     },
   },
   {
@@ -108,25 +118,22 @@ export const customPropertyTools = [
   {
     name: 'update_device_custom_property',
     writeScope: 'write',
-    description: 'Update a custom property value on a specific device. propertyType must match the property definition (HTML_LINK, TEXT, DATE, ENUMERATED, or PASSWORD).',
+    description: 'Update a custom property value on a specific device. The N-central PUT endpoint requires propertyName and propertyType — pass the existing values (use get_device_custom_property if unsure). propertyType must match the property definition (HTML_LINK, TEXT, DATE, ENUMERATED, or PASSWORD).',
     inputSchema: {
       type: 'object',
       properties: {
         deviceId: { type: 'string', description: 'The device ID' },
         propertyId: { type: 'number', description: 'The custom property ID' },
-        propertyName: { type: 'string', description: 'The property name' },
+        propertyName: { type: 'string', description: 'The property name (must match the existing property definition)' },
         propertyType: { type: 'string', description: 'Property type', enum: PROPERTY_TYPES },
         value: { type: 'string', description: 'The property value to set' },
         enumeratedValueList: { type: 'array', description: 'Allowed values if propertyType is ENUMERATED', items: { type: 'string' } },
       },
-      required: ['deviceId', 'propertyId'],
+      required: ['deviceId', 'propertyId', 'propertyName', 'propertyType', 'value'],
     },
     handler: async (args) => {
       const { deviceId, propertyId, ...body } = args;
-      return await apiPut(
-        `/api/devices/${sanitizePathParam(deviceId)}/custom-properties/${sanitizePathParam(propertyId)}`,
-        { propertyId: String(propertyId), ...body }
-      );
+      return await updateCustomProperty('/api/devices', deviceId, propertyId, body);
     },
   },
   {
@@ -147,10 +154,7 @@ export const customPropertyTools = [
     },
     handler: async (args) => {
       const { orgUnitId, propertyId, ...body } = args;
-      return await apiPut(
-        `/api/org-units/${sanitizePathParam(orgUnitId)}/custom-properties/${sanitizePathParam(propertyId)}`,
-        { propertyId: String(propertyId), ...body }
-      );
+      return await updateCustomProperty('/api/org-units', orgUnitId, propertyId, body);
     },
   },
   {

@@ -1,24 +1,24 @@
 /** Device tools — N-central device API endpoints. */
 
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete, sanitizePathParam } from '../client.js';
-import { paginationParams, paginationArgs } from '../shared.js';
-import { fetchAll } from '../paginator.js';
+import { paginationParams, formatParam, fetchOrPaginate, formatResult } from '../shared.js';
 
 export const deviceTools = [
   {
     name: 'list_devices',
-    description: 'Retrieve the list of all devices from N-central for the logged-in user. Returns one page by default — set `all: true` to auto-paginate through every page.',
+    description: 'Retrieve the list of all devices from N-central for the logged-in user. Returns one page by default — set `all: true` to auto-paginate. Use `format: "csv"` for spreadsheet-ready output.',
     inputSchema: {
       type: 'object',
       properties: {
         filterId: { type: 'number', description: 'Filter ID to apply to device list' },
         ...paginationParams,
+        ...formatParam,
       },
     },
     handler: async (args) => {
       const params = args.filterId != null ? { filterId: args.filterId } : {};
-      if (args.all) return await fetchAll('/api/devices', params);
-      return await apiGet('/api/devices', { ...params, ...paginationArgs(args) });
+      const result = await fetchOrPaginate('/api/devices', params, args);
+      return formatResult(result, args.format);
     },
   },
   {
@@ -79,19 +79,20 @@ export const deviceTools = [
   },
   {
     name: 'list_devices_by_org_unit',
-    description: 'Retrieve the list of devices belonging to a specific organization unit. Returns one page by default — set `all: true` to auto-paginate.',
+    description: 'Retrieve the list of devices belonging to a specific organization unit. Returns one page by default — set `all: true` to auto-paginate. Use `format: "csv"` for spreadsheet-ready output.',
     inputSchema: {
       type: 'object',
       properties: {
         orgUnitId: { type: 'number', description: 'The organization unit ID' },
         ...paginationParams,
+        ...formatParam,
       },
       required: ['orgUnitId'],
     },
     handler: async (args) => {
       const path = `/api/org-units/${sanitizePathParam(args.orgUnitId)}/devices`;
-      if (args.all) return await fetchAll(path);
-      return await apiGet(path, paginationArgs(args));
+      const result = await fetchOrPaginate(path, {}, args);
+      return formatResult(result, args.format);
     },
   },
   {

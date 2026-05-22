@@ -1,3 +1,4 @@
+// @ts-check
 /**
  * Pagination and concurrency utilities for N-central API.
  */
@@ -9,6 +10,7 @@ const MAX_PAGES = 200;
 
 /**
  * Auto-paginate through a list endpoint, returning all items.
+ * Throws if MAX_PAGES is reached with more pages still indicated.
  */
 export async function fetchAll(path, params = {}, pageSize = DEFAULT_PAGE_SIZE) {
   const all = [];
@@ -16,11 +18,17 @@ export async function fetchAll(path, params = {}, pageSize = DEFAULT_PAGE_SIZE) 
 
   while (page <= MAX_PAGES) {
     const res = await apiGet(path, { ...params, pageNumber: page, pageSize });
-    const items = res.data || [];
+    if (res == null) break;
+
+    const items = Array.isArray(res) ? res : (res.data ?? []);
     all.push(...items);
 
     const totalPages = res.totalPages ?? res._page?.totalPages ?? 1;
     if (page >= totalPages || items.length === 0) break;
+
+    if (page === MAX_PAGES && page < totalPages) {
+      throw new Error(`fetchAll: hit MAX_PAGES (${MAX_PAGES}) on ${path} with ${totalPages} pages reported. Use a tighter filter or paginate manually.`);
+    }
     page++;
   }
 
@@ -28,13 +36,17 @@ export async function fetchAll(path, params = {}, pageSize = DEFAULT_PAGE_SIZE) 
 }
 
 /**
- * Map over items with bounded concurrency. Results preserve input order.
- * Errors are captured per-item as { _error, _item } instead of throwing.
+ * Map over items with bounded concurrency. Preserves input order.
+ * Errors are captured per-item as `{ _error, _item }`.
  *
- * Safe without locks: Node is single-threaded and `nextIndex++` only
- * executes between awaits, so two workers can't grab the same index.
+ * @template T, R
+ * @param {readonly T[] | null | undefined} items
+ * @param {(item: T, index: number) => Promise<R>} fn
+ * @param {number} [concurrency=5]
+ * @returns {Promise<(R | { _error: string, _item: T })[]>}
  */
 export async function mapConcurrent(items, fn, concurrency = 5) {
+  if (!items?.length) return [];
   const results = new Array(items.length);
   let nextIndex = 0;
 
@@ -51,6 +63,11 @@ export async function mapConcurrent(items, fn, concurrency = 5) {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   return results;
+}
+
+/** Unwrap an N-central `{ data: ... }` envelope, or return the value as-is. */
+export function unwrap(res) {
+  return res?.data ?? res;
 }
 
 /**
@@ -74,7 +91,10 @@ function flatten(obj, prefix = '') {
   for (const [k, v] of Object.entries(obj)) {
     const key = prefix ? `${prefix}.${k}` : k;
     if (v == null) out[key] = '';
-    else if (Array.isArray(v)) out[key] = v.join('; ');
+    else if (v instanceof Date) out[key] = v.toISOString();
+    else if (Array.isArray(v)) {
+      out[key] = v.map(x => (x && typeof x === 'object' ? JSON.stringify(x) : x)).join('; ');
+    }
     else if (typeof v === 'object') Object.assign(out, flatten(v, key));
     else out[key] = v;
   }
@@ -82,6 +102,7 @@ function flatten(obj, prefix = '') {
 }
 
 function csvEscape(value) {
+  if (value instanceof Date) value = value.toISOString();
   const s = String(value);
   return s.includes(',') || s.includes('"') || s.includes('\n')
     ? `"${s.replace(/"/g, '""')}"`

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { sanitizePathParam } from '../src/client.js';
 import { toCsv } from '../src/paginator.js';
 import { auditLog } from '../src/logging.js';
+import { deduplicateUsers, buildDeviceCountByOrg } from '../src/tools/reports.js';
 
 describe('sanitizePathParam', () => {
   it('accepts numeric IDs', () => {
@@ -79,25 +80,9 @@ describe('auditLog', () => {
 });
 
 // ---------------------------------------------------------------------------
-// report_all_users_by_so — deduplication logic
+// report_all_users_by_so — deduplication logic (imported from reports.js)
 // ---------------------------------------------------------------------------
 describe('report_all_users_by_so deduplication', () => {
-  function deduplicateUsers(perOrgUsers) {
-    const seen = new Set();
-    const users = [];
-    for (const batch of perOrgUsers) {
-      if (!Array.isArray(batch)) continue;
-      for (const user of batch) {
-        const uid = user.userId;
-        if (uid != null && !seen.has(uid)) {
-          seen.add(uid);
-          users.push(user);
-        }
-      }
-    }
-    return users;
-  }
-
   it('removes duplicate users that appear in multiple org units', () => {
     const shared = { userId: 1, userName: 'a@b.com' };
     const batches = [
@@ -124,21 +109,9 @@ describe('report_all_users_by_so deduplication', () => {
 });
 
 // ---------------------------------------------------------------------------
-// report_customer_site_summary — site→customer device count rollup
+// report_customer_site_summary — site→customer device count rollup (imported from reports.js)
 // ---------------------------------------------------------------------------
 describe('report_customer_site_summary device rollup', () => {
-  function buildDeviceCountByOrg(devices, siteParentMap) {
-    const deviceCountByOrg = {};
-    for (const d of devices) {
-      const orgId = d.orgUnitId || d.customerId;
-      if (!orgId) continue;
-      deviceCountByOrg[orgId] = (deviceCountByOrg[orgId] || 0) + 1;
-      const parentId = siteParentMap[orgId];
-      if (parentId) deviceCountByOrg[parentId] = (deviceCountByOrg[parentId] || 0) + 1;
-    }
-    return deviceCountByOrg;
-  }
-
   it('credits site devices to parent customer', () => {
     const siteParentMap = { 200: 100 };
     const devices = [
