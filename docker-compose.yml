@@ -5,10 +5,11 @@ services:
     # Loads all env vars from .env. NC_SERVER_URL / NC_JWT_TOKEN / MCP_API_KEY are required.
     env_file:
       - .env
-    # Bind to localhost on the host by default. To expose to the LAN, change the
-    # left side to "0.0.0.0:3100:3100" and ensure MCP_API_KEY is set.
+    # Published on all host interfaces for LAN access. MCP_API_KEY MUST be set
+    # (the /mcp endpoint is gated by it). Note /healthz and /metrics are
+    # intentionally pre-auth, so keep this behind a trusted network / firewall.
     ports:
-      - "127.0.0.1:3100:3100"
+      - "0.0.0.0:3100:3100"
     environment:
       # Inside the container the listener must bind to all interfaces so the
       # host port mapping above can reach it. Host firewall + the bind on the

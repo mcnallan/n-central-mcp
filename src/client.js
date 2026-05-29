@@ -2,6 +2,7 @@
 /** N-central API client: authenticated HTTP with retry and auto re-auth on 401. */
 
 import { getAccessToken, reAuthenticate } from './auth.js';
+import { getContext, MULTI_TENANT } from './context.js';
 import { auditLog } from './logging.js';
 import { inc } from './metrics.js';
 
@@ -14,17 +15,6 @@ const TIMEOUT_MS = Number(process.env.NC_REQUEST_TIMEOUT_MS) || 30_000;
 // Idempotent methods retry on timeouts and 5xx. POST/PATCH retry only on
 // auth/rate-limit failures (where the request did not reach the handler).
 const IDEMPOTENT_METHODS = new Set(['GET', 'PUT', 'DELETE', 'HEAD']);
-
-/** @type {string | null} */
-let serverUrl = null;
-
-/**
- * Set the base N-central server URL (trailing slashes stripped).
- * @param {string} url
- */
-export function setServerUrl(url) {
-  serverUrl = url.replace(/\/+$/, '');
-}
 
 /**
  * Validate a value for safe use in a URL path segment.
@@ -56,14 +46,17 @@ export function sanitizePathParam(value) {
  * @returns {Promise<unknown>}
  */
 async function apiRequest(method, path, { params = {}, body = null } = {}) {
-  if (!serverUrl) throw new Error('Server URL not set');
+  // Resolve the tenant context once and reuse it for the whole request,
+  // including retries — never re-read mid-flight (defends against any future
+  // async-context drift, and one request always belongs to one tenant).
+  const ctx = getContext();
 
-  const url = buildUrl(path, params);
+  const url = buildUrl(ctx.fqdn, path, params);
   const hasBody = body != null;
   const canRetryTransient = IDEMPOTENT_METHODS.has(method);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const token = await getAccessToken();
+    const token = await getAccessToken(ctx);
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
 
@@ -114,7 +107,7 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
         const delay = attempt > 0 ? RETRY_DELAY_MS * 2 ** (attempt - 1) : 0;
         auditLog('api_retry', { method, path: stripQuery(path), status: 401, attempt: attempt + 1, delayMs: delay });
         inc('nc_mcp_api_retries_total', { reason: '401' });
-        await reAuthenticate();
+        await reAuthenticate(ctx);
         if (delay) await sleep(delay);
         continue;
       }
@@ -133,8 +126,11 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
     }
 
     if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`API error ${res.status} on ${method} ${stripQuery(path)}: ${truncate(errBody, 200)}`);
+      // In multi-tenant mode, do not echo the response body into the error —
+      // it can carry tenant-identifying detail into shared operator logs.
+      const errBody = MULTI_TENANT ? '' : await res.text();
+      const detail = errBody ? `: ${truncate(errBody, 200)}` : '';
+      throw new Error(`API error ${res.status} on ${method} ${stripQuery(path)}${detail}`);
     }
 
     if (res.status === 204) return null;
@@ -156,7 +152,8 @@ async function apiRequest(method, path, { params = {}, body = null } = {}) {
 
     // N-central wraps some errors as `error message` inside 200 responses.
     if (data?.['error message']) {
-      throw new Error(`API error in 200 response: ${truncate(data['error message'], 200)}`);
+      const detail = MULTI_TENANT ? '' : `: ${truncate(data['error message'], 200)}`;
+      throw new Error(`API error in 200 response${detail}`);
     }
 
     return data;
@@ -195,8 +192,8 @@ function truncate(str, max) {
   return s.length > max ? `${s.slice(0, max)}...` : s;
 }
 
-function buildUrl(path, params) {
-  const url = new URL(`${serverUrl}${path}`);
+function buildUrl(fqdn, path, params) {
+  const url = new URL(`${fqdn}${path}`);
   for (const [key, value] of Object.entries(params)) {
     if (value != null && value !== '') url.searchParams.set(key, String(value));
   }

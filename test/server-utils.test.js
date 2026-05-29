@@ -5,7 +5,13 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { safeCompare, jsonSchemaToZod, parseAuthorizationHeader } from '../src/server-utils.js';
+import {
+  safeCompare,
+  jsonSchemaToZod,
+  parseAuthorizationHeader,
+  validateNcFqdn,
+  looksLikeJwt,
+} from '../src/server-utils.js';
 
 // ---------------------------------------------------------------------------
 // safeCompare
@@ -135,5 +141,91 @@ describe('parseAuthorizationHeader', () => {
     // "Bearer  x" splits to ['Bearer', '', 'x'] — three parts, not two — so raw return.
     const out = parseAuthorizationHeader('Bearer  x');
     assert.equal(out, 'Bearer  x');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateNcFqdn
+// ---------------------------------------------------------------------------
+describe('validateNcFqdn', () => {
+  it('accepts a plain https origin and normalizes it (no trailing slash)', () => {
+    assert.equal(validateNcFqdn('https://ncentral.example.com'), 'https://ncentral.example.com');
+    assert.equal(validateNcFqdn('https://ncentral.example.com/'), 'https://ncentral.example.com');
+  });
+
+  it('preserves an explicit non-default port', () => {
+    assert.equal(validateNcFqdn('https://host.example.com:8443'), 'https://host.example.com:8443');
+  });
+
+  it('rejects non-https schemes', () => {
+    assert.throws(() => validateNcFqdn('http://host.example.com'), /https/);
+    assert.throws(() => validateNcFqdn('ftp://host.example.com'), /https/);
+  });
+
+  it('rejects embedded credentials (userinfo)', () => {
+    assert.throws(() => validateNcFqdn('https://evil@allowed.com'), /credentials/);
+    assert.throws(() => validateNcFqdn('https://user:pass@host.com'), /credentials/);
+  });
+
+  it('rejects a path, query, or fragment', () => {
+    assert.throws(() => validateNcFqdn('https://host.com/api'), /path|query|fragment/);
+    assert.throws(() => validateNcFqdn('https://host.com/?x=1'), /path|query|fragment/);
+    assert.throws(() => validateNcFqdn('https://host.com/#f'), /path|query|fragment/);
+  });
+
+  it('rejects non-string / empty input', () => {
+    assert.throws(() => validateNcFqdn(undefined), /required/);
+    assert.throws(() => validateNcFqdn(''), /required/);
+    assert.throws(() => validateNcFqdn('   '), /required/);
+    assert.throws(() => validateNcFqdn('not a url'), /valid URL/);
+  });
+
+  it('enforces an allowlist by exact or DNS-suffix match', () => {
+    const allow = ['ncentral.com', 'n-able.com'];
+    assert.equal(validateNcFqdn('https://ncentral.com', allow), 'https://ncentral.com');
+    assert.equal(validateNcFqdn('https://eu.ncentral.com', allow), 'https://eu.ncentral.com');
+    assert.equal(validateNcFqdn('https://demo.n-able.com', allow), 'https://demo.n-able.com');
+  });
+
+  it('rejects substring / look-alike hosts that are not true suffixes', () => {
+    const allow = ['ncentral.com'];
+    // suffix-spoof: ncentral.com is NOT a DNS-suffix of these
+    assert.throws(() => validateNcFqdn('https://ncentral.com.evil.com', allow), /allowlist/);
+    assert.throws(() => validateNcFqdn('https://evilncentral.com', allow), /allowlist/);
+    assert.throws(() => validateNcFqdn('https://ncentralXcom', allow), /allowlist/);
+    assert.throws(() => validateNcFqdn('https://notallowed.io', allow), /allowlist/);
+  });
+
+  it('allows any https host when the allowlist is empty', () => {
+    assert.equal(validateNcFqdn('https://anything.io', []), 'https://anything.io');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// looksLikeJwt
+// ---------------------------------------------------------------------------
+describe('looksLikeJwt', () => {
+  it('accepts three non-empty base64url segments', () => {
+    assert.equal(looksLikeJwt('aaa.bbb.ccc'), true);
+    assert.equal(looksLikeJwt('eyJhbGci.eyJzdWIi.S-flKx_w0'), true);
+  });
+
+  it('rejects wrong segment counts', () => {
+    assert.equal(looksLikeJwt('aaa.bbb'), false);
+    assert.equal(looksLikeJwt('aaa.bbb.ccc.ddd'), false);
+    assert.equal(looksLikeJwt('plain-token'), false);
+  });
+
+  it('rejects empty segments and non-base64url characters', () => {
+    assert.equal(looksLikeJwt('aaa..ccc'), false);
+    assert.equal(looksLikeJwt('aaa.bbb.'), false);
+    assert.equal(looksLikeJwt('aa+a.bbb.ccc'), false);
+    assert.equal(looksLikeJwt('aaa.bb/b.ccc'), false);
+  });
+
+  it('rejects non-string input', () => {
+    assert.equal(looksLikeJwt(undefined), false);
+    assert.equal(looksLikeJwt(null), false);
+    assert.equal(looksLikeJwt(123), false);
   });
 });

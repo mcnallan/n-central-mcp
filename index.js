@@ -9,12 +9,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import http from 'http';
 
-import { safeCompare, jsonSchemaToZod, parseAuthorizationHeader } from './src/server-utils.js';
+import { safeCompare, jsonSchemaToZod, parseAuthorizationHeader, validateNcFqdn, looksLikeJwt } from './src/server-utils.js';
 import { inc, setGauge, renderPrometheus } from './src/metrics.js';
 
-import { authenticate } from './src/auth.js';
-import { setServerUrl } from './src/client.js';
-import { registerResources, RESOURCE_COUNT } from './src/resources.js';
+import { als, makeContext, ENV_CONTEXT, MULTI_TENANT } from './src/context.js';
+import { evictTenant } from './src/auth.js';
+import { registerResources, RESOURCE_COUNT, evictTenantCache } from './src/resources.js';
 import { registerPrompts, PROMPT_COUNT } from './src/prompts.js';
 import { auditLog } from './src/logging.js';
 import { isToolAllowed as _isToolAllowed, buildToolAnnotations } from './src/tool-registry.js';
@@ -31,13 +31,18 @@ import { psaTools } from './src/tools/psa.js';
 import { serverInfoTools } from './src/tools/server-info.js';
 import { reportTools } from './src/tools/reports.js';
 
-const NC_SERVER_URL = process.env.NC_SERVER_URL;
-const NC_JWT_TOKEN = process.env.NC_JWT_TOKEN;
+// Host suffixes a client-supplied X-NC-FQDN must match (SSRF guard). Empty = any https host.
+const NC_FQDN_ALLOWLIST = (process.env.NC_FQDN_ALLOWLIST || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
-if (!NC_SERVER_URL || !NC_JWT_TOKEN) {
+// Single-tenant mode requires env credentials at boot. Multi-tenant mode
+// (NC_MULTI_TENANT=1) accepts them per-request via X-NC-FQDN / X-NC-JWT headers,
+// so env credentials are optional there.
+if (!MULTI_TENANT && !ENV_CONTEXT) {
   console.error('Error: NC_SERVER_URL and NC_JWT_TOKEN environment variables are required.');
   console.error('  NC_SERVER_URL: Your N-central server URL (e.g. https://ncentral.example.com)');
   console.error('  NC_JWT_TOKEN:  Your User-API JWT token from N-central UI');
+  console.error('  (or set NC_MULTI_TENANT=1 to accept per-request credentials over HTTP)');
   process.exit(1);
 }
 
@@ -132,26 +137,48 @@ for (const tool of allTools) {
   if (tool.writeScope && tool.writeScope !== 'read') SENSITIVE_TOOLS.add(tool.name);
 }
 
-let authenticated = false;
-let pendingAuthInit = null;
+/** Error type for invalid/missing per-request credentials → HTTP 400. */
+class ContextError extends Error {}
 
-async function ensureAuthenticated() {
-  if (authenticated) return;
-  if (pendingAuthInit) return pendingAuthInit;
-
-  const p = (async () => {
-    setServerUrl(NC_SERVER_URL);
-    await authenticate(NC_SERVER_URL, NC_JWT_TOKEN);
-    authenticated = true;
-    console.error(`Authenticated with N-central at ${NC_SERVER_URL}`);
-  })();
-
-  pendingAuthInit = p;
-  try {
-    await p;
-  } finally {
-    pendingAuthInit = null;
+/**
+ * Resolve the tenant context for an incoming HTTP request. Per-request
+ * X-NC-FQDN / X-NC-JWT headers take precedence; otherwise fall back to env
+ * credentials (single-tenant). Throws ContextError when credentials are
+ * required but absent or invalid (the caller maps that to a 400).
+ *
+ * @param {{ headers: Record<string, string | string[] | undefined> }} req
+ * @returns {import('./src/context.js').TenantContext}
+ */
+function resolveRequestContext(req) {
+  // Single-tenant: ALWAYS use the operator's env credentials, and ignore any
+  // client-supplied X-NC-* headers. Honoring them here would let any caller past
+  // the MCP_API_KEY gate redirect the server to an arbitrary host (SSRF) or
+  // override the configured tenant. Headers are strictly a multi-tenant feature.
+  if (!MULTI_TENANT) {
+    if (ENV_CONTEXT) return ENV_CONTEXT;
+    throw new ContextError('No N-central credentials configured');
   }
+
+  // Multi-tenant: credentials MUST come from per-request headers.
+  const fqdnHeader = req.headers['x-nc-fqdn'];
+  const jwtHeader = req.headers['x-nc-jwt'];
+  if (typeof fqdnHeader !== 'string' || typeof jwtHeader !== 'string') {
+    // Reject missing or multi-valued (array) headers — a tenant is exactly one (fqdn, jwt).
+    throw new ContextError('Both X-NC-FQDN and X-NC-JWT must be present and single-valued');
+  }
+  if (!looksLikeJwt(jwtHeader)) throw new ContextError('X-NC-JWT is not a valid JWT');
+  let fqdn;
+  try {
+    fqdn = validateNcFqdn(fqdnHeader, NC_FQDN_ALLOWLIST);
+  } catch (err) {
+    throw new ContextError(`Invalid X-NC-FQDN: ${err.message}`);
+  }
+  return makeContext(fqdn, jwtHeader);
+}
+
+/** Run fn inside the tenant's async context, so getContext() resolves to it. */
+function runWithCtx(ctx, fn) {
+  return ctx ? als.run(ctx, fn) : fn();
 }
 
 function createServer() {
@@ -179,8 +206,8 @@ function createServer() {
     srv.tool(toolName, tool.description, schemaShape, annotations, async (args) => {
       const t0 = Date.now();
       try {
-        await ensureAuthenticated();
-
+        // Auth is lazy and per-tenant: the first apiRequest for this tenant
+        // (resolved from the active async context) authenticates on demand.
         if (SENSITIVE_TOOLS.has(toolName)) {
           auditLog('sensitive_tool_call', { tool: toolName, args });
         }
@@ -204,7 +231,7 @@ function createServer() {
     });
   }
 
-  registerResources(srv, ensureAuthenticated);
+  registerResources(srv);
   registerPrompts(srv);
   return srv;
 }
@@ -279,6 +306,12 @@ process.on('uncaughtException', (error) => {
 
 async function main() {
   try {
+    if (MULTI_TENANT && !MCP_PORT) {
+      console.error('FATAL: NC_MULTI_TENANT=1 requires HTTP mode (set MCP_PORT).');
+      console.error('       Per-request credentials cannot be supplied over stdio.');
+      process.exit(1);
+    }
+
     if (MCP_PORT && !MCP_API_KEY && !MCP_ALLOW_UNAUTHENTICATED) {
       console.error('FATAL: MCP_PORT is set but MCP_API_KEY is not. HTTP mode requires an API key.');
       console.error('       Set MCP_API_KEY (e.g. `openssl rand -hex 32`) or set MCP_ALLOW_UNAUTHENTICATED=1 for local dev.');
@@ -287,7 +320,9 @@ async function main() {
 
     if (!QUIET) {
       console.error(`Registered ${allTools.length} tools, ${RESOURCE_COUNT} resources, ${PROMPT_COUNT} prompts (NC_WRITE_MODE=${NC_WRITE_MODE})`);
-      console.error('Auth will be performed on first tool call.');
+      console.error(MULTI_TENANT
+        ? 'Multi-tenant mode: per-request X-NC-FQDN / X-NC-JWT required; auth is per-tenant on first call.'
+        : 'Auth will be performed on first tool call.');
     }
 
     if (MCP_PORT) {
@@ -297,14 +332,44 @@ async function main() {
       if (!MCP_CORS_ORIGIN && !QUIET) {
         console.error('ℹ️  CORS disabled (no MCP_CORS_ORIGIN set).');
       }
+      if (MULTI_TENANT && NC_FQDN_ALLOWLIST.length === 0) {
+        console.error('⚠️  WARNING: NC_MULTI_TENANT=1 with no NC_FQDN_ALLOWLIST — any https FQDN will be accepted (SSRF risk).');
+      }
 
       const transports = new Map();
+      const sessionCtx = new Map();        // sessionId -> TenantContext
+      const tenantRefs = new Map();        // ctx.key -> Set<sessionId>
       const sessionLastActivity = new Map();
       const SESSION_TTL_MS = Number(process.env.MCP_SESSION_TTL_MS) || 30 * 60_000;
       const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
       function validSessionId(id) {
         return typeof id === 'string' && UUID_RE.test(id);
+      }
+
+      function addTenantRef(key, sid) {
+        let set = tenantRefs.get(key);
+        if (!set) { set = new Set(); tenantRefs.set(key, set); }
+        set.add(sid);
+      }
+
+      // Tear down a session; when it was the last session for its tenant, evict
+      // that tenant's cached tokens + resource-cache entries so credential
+      // material doesn't accumulate for the process lifetime. Idempotent.
+      function teardownSession(sid) {
+        transports.delete(sid);
+        sessionLastActivity.delete(sid);
+        const ctx = sessionCtx.get(sid);
+        if (!ctx) return;
+        sessionCtx.delete(sid);
+        const set = tenantRefs.get(ctx.key);
+        if (!set) return;
+        set.delete(sid);
+        if (set.size === 0) {
+          tenantRefs.delete(ctx.key);
+          evictTenant(ctx.key);
+          evictTenantCache(ctx.key);
+        }
       }
 
       const httpServer = http.createServer(async (req, res) => {
@@ -318,7 +383,7 @@ async function main() {
             res.setHeader('Access-Control-Allow-Origin', reqOrigin);
             res.setHeader('Vary', 'Origin');
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id, X-NC-FQDN, X-NC-JWT');
             res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
           }
         }
@@ -378,7 +443,9 @@ async function main() {
 
             if (sessionId && validSessionId(sessionId) && transports.has(sessionId)) {
               sessionLastActivity.set(sessionId, Date.now());
-              await transports.get(sessionId).handleRequest(req, res, body);
+              const ctx = sessionCtx.get(sessionId);
+              const transport = transports.get(sessionId);
+              await runWithCtx(ctx, () => transport.handleRequest(req, res, body));
             } else if (!sessionId && isInitializeRequest(body)) {
               if (transports.size >= MAX_SESSIONS) {
                 auditLog('session_limit_reached', { ip: clientIp, count: transports.size });
@@ -386,24 +453,41 @@ async function main() {
                 res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Server session limit reached' }, id: null }));
                 return;
               }
-              auditLog('session_init', { ip: clientIp });
+
+              // Resolve + validate credentials BEFORE constructing the transport,
+              // so an invalid/missing-credential init is rejected (400) without
+              // ever creating a session. The ctx is bound to this session for its
+              // lifetime — one session = one tenant; later header changes ignored.
+              let ctx;
+              try {
+                ctx = resolveRequestContext(req);
+              } catch (err) {
+                if (err instanceof ContextError) {
+                  auditLog('context_rejected', { ip: clientIp, reason: err.message });
+                  res.writeHead(400, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: err.message }, id: null }));
+                  return;
+                }
+                throw err;
+              }
+
+              auditLog('session_init', { ip: clientIp, fqdn: ctx.fqdn, tenant: ctx.key.slice(0, 12) });
               const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => randomUUID(),
                 onsessioninitialized: (sid) => {
                   transports.set(sid, transport);
+                  sessionCtx.set(sid, ctx);
+                  addTenantRef(ctx.key, sid);
                   sessionLastActivity.set(sid, Date.now());
                 },
               });
               transport.onclose = () => {
                 const sid = transport.sessionId;
-                if (sid) {
-                  transports.delete(sid);
-                  sessionLastActivity.delete(sid);
-                }
+                if (sid) teardownSession(sid);
               };
               const server = createServer();
               await server.connect(transport);
-              await transport.handleRequest(req, res, body);
+              await runWithCtx(ctx, () => transport.handleRequest(req, res, body));
             } else {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad request: missing session' }, id: null }));
@@ -426,7 +510,9 @@ async function main() {
             return;
           }
           sessionLastActivity.set(sessionId, Date.now());
-          await transports.get(sessionId).handleRequest(req, res);
+          const ctx = sessionCtx.get(sessionId);
+          const transport = transports.get(sessionId);
+          await runWithCtx(ctx, () => transport.handleRequest(req, res));
           return;
         }
 
@@ -477,8 +563,7 @@ async function main() {
             console.error(`Cleaning stale session: ${sid}`);
             const transport = transports.get(sid);
             // Delete before awaiting close so concurrent requests see 400 instead of a closing transport.
-            transports.delete(sid);
-            sessionLastActivity.delete(sid);
+            teardownSession(sid);
             try { transport?.close(); } catch { /* ignore */ }
           }
         }

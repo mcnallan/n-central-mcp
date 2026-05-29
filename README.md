@@ -12,6 +12,7 @@
 - **MCP Resources** for live org-hierarchy context (`ncentral://org-tree`) and per-entity lookups via templated URIs
 - **MCP Prompts** for common audit and reporting workflows
 - **Two transports**: stdio (for Claude Desktop / local clients) and Streamable HTTP (for remote clients, MCP Inspector, etc.)
+- **Single- or multi-tenant**: self-host against one N-central (env credentials), or run one hosted server many users point at — each targeting their *own* N-central via per-request headers (`NC_MULTI_TENANT=1`), with strict per-request credential isolation. See the **[Setup & Client Guide](docs/SETUP-GUIDE.md)**
 - **Production-grade auth**: JWT exchange with auto-refresh, hash-based bearer-token auth for the HTTP endpoint, CORS allow-list, rate limiting, audit log
 - **Operability**: `/healthz` and `/metrics` (Prometheus text format) endpoints, structured audit logging, configurable retry/timeout/session caps
 
@@ -48,13 +49,17 @@ The most common variables (full list in [.env.example](.env.example)):
 
 | Variable | Required when | Description |
 |---|---|---|
-| `NC_SERVER_URL` | always | Your N-central URL, e.g. `https://ncentral.example.com` |
-| `NC_JWT_TOKEN` | always | User-API JWT from the N-central UI |
+| `NC_SERVER_URL` | single-tenant | Your N-central URL, e.g. `https://ncentral.example.com`. *Not* needed in multi-tenant mode |
+| `NC_JWT_TOKEN` | single-tenant | User-API JWT from the N-central UI. *Not* needed in multi-tenant mode |
+| `NC_MULTI_TENANT` | hosted mode | Set to `1` to require per-request `X-NC-FQDN`/`X-NC-JWT` headers (HTTP only). See [Multi-Tenant Mode](#multi-tenant-hosted-mode) |
+| `NC_FQDN_ALLOWLIST` | multi-tenant | Comma-separated host suffixes a client may target — SSRF guard (exact or DNS-suffix match) |
 | `NC_WRITE_MODE` | optional | `read-only` \| `write` \| `full` (default `write`) |
 | `MCP_PORT` | HTTP mode only | Setting this enables HTTP mode (omit for stdio) |
 | `MCP_API_KEY` | HTTP mode | Bearer token clients must present. Generate with `openssl rand -hex 32`. **Required** unless `MCP_ALLOW_UNAUTHENTICATED=1` |
-| `MCP_BIND_ADDRESS` | optional | Interface to bind. `127.0.0.1` (default) for localhost-only; `0.0.0.0` inside Docker |
+| `MCP_BIND_ADDRESS` | optional | Interface to bind. `127.0.0.1` (default) for localhost-only; `0.0.0.0` for Docker / LAN exposure |
 | `MCP_CORS_ORIGIN` | browser clients | Comma-separated allow-list of origins |
+
+> **Connecting a client?** See the **[Setup & Client Guide](docs/SETUP-GUIDE.md)** for copy-paste config for Claude Code, VS Code, Claude Desktop, and Cursor — in both single- and multi-tenant modes.
 
 #### Write modes
 
@@ -125,6 +130,68 @@ Compose maps `127.0.0.1:3100:3100` by default. To expose on the LAN, edit `docke
 curl -s http://127.0.0.1:3100/healthz
 # {"status":"ok","sessions":0}
 ```
+
+---
+
+## Multi-Tenant (Hosted) Mode
+
+By default the server is **single-tenant**: it reads one `NC_SERVER_URL` + `NC_JWT_TOKEN` from
+its environment. That's the right model for an MSP self-hosting it against a single N-central.
+
+Set **`NC_MULTI_TENANT=1`** to host **one** server that many users point at, each targeting a
+**different** N-central server with their **own** JWT — supplied per request via headers in their
+own MCP client config. (Intended for a centrally-hosted demo/eval box, not for routing third
+parties' production credentials through infrastructure you don't control.)
+
+```bash
+# Hosted server (HTTP only — stdio cannot carry per-request headers):
+NC_MULTI_TENANT=1 \
+MCP_PORT=3100 \
+MCP_API_KEY="$(openssl rand -hex 32)" \
+NC_FQDN_ALLOWLIST=ncentral.com,n-able.com \
+node index.js
+```
+
+Each user's MCP client config sends, per request:
+
+```jsonc
+{
+  "mcpServers": {
+    "ncentral": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_API_KEY>",       // gates access to THIS server
+        "X-NC-FQDN": "https://their-ncentral.example.com",
+        "X-NC-JWT":  "<their N-central User-API JWT>"
+      }
+    }
+  }
+}
+```
+
+**Isolation guarantees**
+
+- **One session = one tenant.** Credentials are validated at session init (before the session
+  exists); an invalid/missing header pair is rejected with `400`. The tenant is then bound to the
+  session for its lifetime — later header changes on the same session are ignored.
+- **No shared credential state.** Tokens are keyed per tenant and resolved per request via
+  `AsyncLocalStorage`, so concurrent requests for different servers can never read each other's
+  URL or token. The resource cache is tenant-scoped for the same reason.
+- **Memory only, auto-evicted.** Tokens and cache entries live in memory and are dropped when the
+  last session for a tenant closes. Nothing is persisted; JWTs are never logged.
+- **SSRF guard.** `NC_FQDN_ALLOWLIST` restricts which N-central hosts a client may target (exact
+  or DNS-suffix match). Leave it unset only behind trusted network boundaries — the server warns
+  at startup if it's empty.
+
+**Scaling.** The event loop handles many concurrent users on one process (the work is I/O-bound —
+waiting on N-central). If you outgrow one process, run replicas behind a load balancer with
+**sticky routing by `mcp-session-id`** — StreamableHTTP sessions live in process memory, so a
+session must return to the replica that created it.
+
+> **Tip — multiple servers without hosting:** a self-hoster who just needs to target several
+> N-central servers from their own editor can skip multi-tenant mode entirely and define one
+> stdio entry per server, each with its own `env: { NC_SERVER_URL, NC_JWT_TOKEN }`.
 
 ---
 
@@ -352,6 +419,12 @@ Resources provide live context to the client without requiring explicit tool cal
 | `create_direct_scheduled_task` errors with no script found | Repository ID < 2000 (bundled default) or "Enable API" toggle is OFF | Use a custom-uploaded script; toggle "Enable API" in the UI |
 | Reaching `MAX_PAGES` errors on big environments | `fetchAll` caps at 200 pages × 200 items (40k rows) | Use a tighter filter via the `select` parameter, or call the underlying tool with explicit `pageNumber`/`pageSize` |
 | HTTP mode exits with "FATAL: MCP_PORT is set but MCP_API_KEY is not" | Safety check — HTTP mode requires an API key | Set `MCP_API_KEY=$(openssl rand -hex 32)` or `MCP_ALLOW_UNAUTHENTICATED=1` for local dev |
+| `ERR_CONNECTION_REFUSED` / can't reach `/healthz`/`/metrics` from another machine | Server bound or published to localhost only | Set `MCP_BIND_ADDRESS=0.0.0.0`; in Docker publish `0.0.0.0:3100:3100` (not `127.0.0.1:3100:3100`) and connect to the host's **LAN IP**, not `localhost`. If `curl 127.0.0.1:3100/healthz` works *on the host* but not remotely, it's the bind/publish scope |
+| Client connects but queries the **wrong** N-central / `X-NC-*` headers ignored | Server not started with `NC_MULTI_TENANT=1` | In single-tenant mode the headers are ignored and env `NC_SERVER_URL`/`NC_JWT_TOKEN` are used. Start with `NC_MULTI_TENANT=1` for header passthrough |
+| `400` at connect in multi-tenant mode | Missing/invalid `X-NC-FQDN` / `X-NC-JWT` | Send both; FQDN must be `https://` and match `NC_FQDN_ALLOWLIST` if set |
+| "FATAL: NC_MULTI_TENANT=1 requires HTTP mode" | Multi-tenant needs per-request headers, which stdio can't carry | Set `MCP_PORT` (run in HTTP mode) |
+
+For client-side setup issues, see the **[Setup & Client Guide](docs/SETUP-GUIDE.md)**.
 
 ---
 
@@ -360,8 +433,9 @@ Resources provide live context to the client without requiring explicit tool cal
 ```
 ├── index.js                  # Entry point — transport selection (stdio / HTTP)
 ├── src/
-│   ├── auth.js               # JWT → Access Token auth, auto-refresh logic
+│   ├── auth.js               # Per-tenant JWT → Access Token auth, auto-refresh logic
 │   ├── client.js             # HTTP client with retry, timeout, and rate-limit handling
+│   ├── context.js            # Per-request tenant context (AsyncLocalStorage) — credential isolation
 │   ├── logging.js            # Structured logger + audit log
 │   ├── metrics.js            # Prometheus counters / gauges
 │   ├── paginator.js          # Auto-pagination, bounded concurrency, CSV helpers
@@ -383,9 +457,14 @@ Resources provide live context to the client without requiring explicit tool cal
 │       ├── server-info.js
 │       └── users.js
 ├── test/
+│   ├── auth-isolation.test.js  # Per-tenant token/credential isolation (forced interleave, 401 path)
+│   ├── isolation.test.js       # End-to-end session isolation, cache, boot matrix, SSRF guard
+│   ├── mock-fetch.js           # Shared test helpers (not a test suite)
 │   ├── helpers.test.js
 │   ├── server-utils.test.js
 │   └── utils.test.js
+├── docs/
+│   └── SETUP-GUIDE.md          # Client setup how-to (Claude Code, VS Code, Claude Desktop, Cursor)
 ├── .env.example
 ├── Dockerfile
 └── docker-compose.yml
