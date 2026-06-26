@@ -35,6 +35,23 @@ coverage/
 *.tgz
 *.json.bak
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.build-tools-venv/
+venv/
+env/
+
 # Local exports / scratch
 reports/
 *.csv

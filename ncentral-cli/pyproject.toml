@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncentral-cli"
+version = "0.1.0"
+description = "Agent-first CLI for N-able N-central through the N-central MCP server."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["ncentral-core==0.1.0"]
+
+[project.optional-dependencies]
+read = ["ncentral-cli-role-read==0.1.0"]
+readwrite = ["ncentral-cli-role-readwrite==0.1.0"]
+destructive = ["ncentral-cli-role-destructive==0.1.0"]
+
+[project.scripts]
+ncentral = "ncentral.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

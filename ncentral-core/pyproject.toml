@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncentral-core"
+version = "0.1.0"
+description = "Core MCP client and catalog helpers for the N-central CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "python-toon",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
